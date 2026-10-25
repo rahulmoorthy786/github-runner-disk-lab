@@ -1,0 +1,99 @@
+name: Runner disk lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Prepare measurement script
+        run: |
+          mkdir -p reports context staging
+
+          cat > "$RUNNER_TEMP/measure.sh" <<'SCRIPT'
+          set -euo pipefail
+          checkpoint="$1"
+
+          {
+            echo "Checkpoint: $checkpoint"
+            date -u
+            echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+
+            df -kT / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+            df -i / "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
+            if [ -d /mnt ]; then
+              df -kT /mnt
+              df -i /mnt
+            fi
+
+            du -sk context staging
+            docker system df
+            docker buildx du
+          } | tee "reports/$checkpoint.txt"
+          SCRIPT
+
+      - name: Measure baseline
+        run: bash "$RUNNER_TEMP/measure.sh" 01-baseline
+
+      - name: Create a bounded build input
+        run: |
+          dd if=/dev/urandom of=context/payload.bin \
+            bs=1M count=64 status=none
+
+          cat > context/Dockerfile <<'DOCKERFILE'
+          FROM scratch
+          COPY payload.bin /payload.bin
+          DOCKERFILE
+
+      - name: Measure after input creation
+        run: bash "$RUNNER_TEMP/measure.sh" 02-after-input
+
+      - name: Build the lab image
+        run: |
+          docker build \
+            --tag runner-disk-lab:local \
+            context
+
+      - name: Measure after build
+        run: bash "$RUNNER_TEMP/measure.sh" 03-after-build
+
+      - name: Stage the image as an archive
+        run: |
+          docker image save \
+            --output staging/runner-disk-lab.tar \
+            runner-disk-lab:local
+
+      - name: Measure before upload
+        run: bash "$RUNNER_TEMP/measure.sh" 04-before-upload
+
+      - name: Upload the staged archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: lab-image
+          path: staging/runner-disk-lab.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Measure after upload
+        run: bash "$RUNNER_TEMP/measure.sh" 05-after-upload
+
+      - name: Upload measurement reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: disk-measurements
+          path: reports/
+          retention-days: 1
+          if-no-files-found: error
